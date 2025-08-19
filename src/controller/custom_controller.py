@@ -2,8 +2,9 @@
 
 import pdb
 import pyperclip
-import json # <--- 新增导入
-from typing import Optional, Type, Callable, Dict, Any, Union, Awaitable, TypeVar
+import json
+import base64 # 新增导入
+from typing import Optional, Type, Callable, Dict, Any, Union, Awaitable, TypeVar, Tuple # 新增 Tuple
 from pydantic import BaseModel
 from browser_use.agent.views import ActionResult
 from browser_use.browser.context import BrowserContext
@@ -60,10 +61,11 @@ class CustomController(Controller):
             self._omni_parser_client = OmniParserClient()
         return self._omni_parser_client
 
-    async def _get_desktop_elements(self) -> list[Dict[str, Any]]:
+    # MODIFIED: Return screenshot data along with elements
+    async def get_desktop_elements(self) -> Tuple[list[Dict[str, Any]], str]:
         """
-        Helper function to capture the screen and parse it for UI elements.
-        This is the core perception mechanism for the desktop scene.
+        Captures the screen, parses it for UI elements, and returns both the
+        elements and the base64 encoded screenshot.
         """
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
             screenshot_path = tmp_file.name
@@ -71,8 +73,15 @@ class CustomController(Controller):
         try:
             pyautogui.screenshot(screenshot_path)
             logger.info(f"Desktop screenshot saved to temporary file: {screenshot_path}")
+            
+            # Get parsed elements
             parsed_elements = await self.omni_parser_client.parse_image(screenshot_path)
-            return parsed_elements
+            
+            # Read image and encode to base64
+            with open(screenshot_path, "rb") as image_file:
+                screenshot_b64 = base64.b64encode(image_file.read()).decode('utf-8')
+                
+            return parsed_elements, screenshot_b64
         finally:
             if os.path.exists(screenshot_path):
                 os.remove(screenshot_path)
@@ -140,7 +149,8 @@ class CustomController(Controller):
             "Captures the entire desktop screen and returns a list of all visible UI elements, including their descriptions and locations. Use this to understand what is currently on the desktop."
         )
         async def get_desktop_ui_elements(context: Dict[str, Any]) -> ActionResult:
-            elements = await self._get_desktop_elements()
+            # MODIFIED: Now returns a tuple
+            elements, screenshot_b64 = await self.get_desktop_elements()
             formatted_elements = "\n".join([f"- {el['content']} ({el['type']})" for el in elements])
             result_text = f"Found {len(elements)} elements on the desktop:\n{formatted_elements}"
             
@@ -187,7 +197,6 @@ class CustomController(Controller):
         @self.registry.action(
             "Presses a combination of keyboard keys simultaneously (a hotkey). The keys must be provided as a JSON formatted string of a list."
         )
-        # **FIX**: Changed parameter to `keys_json: str` and will parse it inside.
         async def press_hotkey_on_desktop(keys_json: str) -> ActionResult:
             try:
                 keys = json.loads(keys_json)
