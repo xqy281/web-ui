@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import json
 from typing import Literal, Optional, Dict, Any
 
 from browser_use.agent.gif import create_history_gif
@@ -21,8 +22,10 @@ from browser_use.agent.views import (
 from browser_use.browser.views import BrowserStateHistory
 from browser_use.utils import time_execution_async, SignalHandler
 from dotenv import load_dotenv
-from browser_use.agent.message_manager.utils import is_model_without_tool_support
-from langchain_core.messages import HumanMessage
+# 确保导入所有需要的辅助函数和异常类型
+from browser_use.agent.message_manager.utils import is_model_without_tool_support, convert_input_messages, extract_json_from_model_output
+from langchain_core.messages import HumanMessage, BaseMessage, AIMessage
+from pydantic import ValidationError
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -55,6 +58,26 @@ class BrowserUseAgent(Agent):
         else:
             return tool_calling_method
 
+    def _log_messages_for_llm(self, messages: list[BaseMessage]):
+        log_str = "\n--- START: CONTEXT FOR LLM ---\n"
+        for i, msg in enumerate(messages):
+            log_str += f"--- Message {i+1}: Type: {type(msg).__name__} ---\n"
+            if isinstance(msg.content, str):
+                log_str += f"{msg.content}\n"
+            elif isinstance(msg.content, list):
+                for item in msg.content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        log_str += f"Text: {item.get('text')}\n"
+                    elif isinstance(item, dict) and item.get("type") == "image_url":
+                        log_str += "Image: [Base64 Data]\n"
+            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                try:
+                    log_str += f"Tool Calls: {json.dumps(msg.tool_calls, indent=2)}\n"
+                except TypeError:
+                    log_str += f"Tool Calls: {msg.tool_calls}\n"
+        log_str += "--- END: CONTEXT FOR LLM ---\n"
+        logger.info(log_str)
+
     async def _decide_scene(self) -> Literal['web', 'desktop']:
         """
         Uses the LLM to decide which scene (web or desktop) to focus on for the next step.
@@ -67,7 +90,9 @@ class BrowserUseAgent(Agent):
                     memory_summary = thoughts[-1].memory
 
             last_action_summary = "None"
-            if self.state.history and self.state.history.last_action():
+            if (self.state.history and self.state.history.history 
+                and self.state.history.history[-1].model_output 
+                and self.state.history.history[-1].model_output.action):
                 last_action_summary = str(self.state.history.last_action())
 
             prompt = f"""
@@ -92,6 +117,64 @@ class BrowserUseAgent(Agent):
             logger.error(f"Error during scene decision: {e}. Defaulting to 'web'.", exc_info=True)
             return "web"
 
+    @time_execution_async('--get_next_action')
+    async def get_next_action(self, messages: list[BaseMessage]) -> AgentOutput | None:
+        """
+        Gets the next action from the LLM by calling it and parsing the response.
+        This method is overridden to handle scene-specific action model creation and add logging.
+        """
+        if self.settings.planner_llm and self.state.n_steps % self.settings.planner_interval == 0:
+            self.state.last_plan = await self._get_plan(messages)
+            self.message_manager.add_plan(self.state.last_plan)
+            messages = self.message_manager.get_messages()
+
+        output_model: type[ActionModel]
+        if self.current_scene == 'desktop':
+            output_model = self.controller.registry.create_action_model(page=None)
+        else:
+            current_page = await self.browser_context.get_current_page()
+            output_model = self.controller.registry.create_action_model(page=current_page)
+        
+        full_output_model = AgentOutput.type_with_custom_actions(output_model)
+
+        input_messages = convert_input_messages(messages, self.model_name)
+
+        try:
+            response = await self.llm.ainvoke(input_messages)
+            
+            raw_response_content = response.content if isinstance(response, AIMessage) else str(response)
+            logger.info(f"\n--- RAW LLM RESPONSE ---\n{raw_response_content}\n--- END RAW LLM RESPONSE ---\n")
+
+            if self.settings.tool_calling_method in {'function_calling', 'tools'}:
+                if not response.tool_calls:
+                    return None
+                tool_call = response.tool_calls[0]
+                if 'args' not in tool_call or not isinstance(tool_call['args'], dict):
+                    return None
+                return full_output_model.model_validate(tool_call['args'])
+            
+            elif self.settings.tool_calling_method == 'json_mode':
+                if isinstance(response, AIMessage):
+                    try:
+                        result_dict = extract_json_from_model_output(response.content)
+                        return full_output_model.model_validate(result_dict)
+                    except (json.JSONDecodeError, ValueError, ValidationError) as e:
+                        logger.warning(f'Failed to parse model output: {response.content} {str(e)}')
+                        return None
+            else:  # raw or auto
+                if isinstance(response, AIMessage):
+                    try:
+                        result_dict = extract_json_from_model_output(response.content)
+                        return full_output_model.model_validate(result_dict)
+                    except (json.JSONDecodeError, ValueError, ValidationError) as e:
+                        logger.warning(f'Failed to parse model output: {response.content} {str(e)}')
+                        return None
+        except Exception as e:
+            logger.error(f"Error getting next action from LLM: {e}", exc_info=True)
+            return None
+        
+        return None
+
     async def _desktop_step(self, step_info: AgentStepInfo) -> None:
         """
         Handles the full logic for a step occurring in the 'desktop' scene.
@@ -112,11 +195,17 @@ class BrowserUseAgent(Agent):
         self.message_manager.cut_messages()
         messages = self.message_manager.get_messages()
         
-        model_output: AgentOutput | None = await self.get_next_action(messages)
+        self._log_messages_for_llm(messages)
 
-        if not model_output:
-            self.state.consecutive_failures += 1
-            return
+        model_output: AgentOutput | None = await self.get_next_action(messages)
+        logger.info(f"\n--- PARSED AGENT OUTPUT ---\n{model_output}\n--- END PARSED AGENT OUTPUT ---\n")
+
+        if not model_output or not model_output.action:
+            logger.warning("LLM failed to produce a valid action. Creating empty action to proceed.")
+            model_output = AgentOutput(
+                current_state={"evaluation_previous_goal": "Failure", "memory": "LLM did not generate a valid action.", "next_goal": "Retry previous step."},
+                action=[]
+            )
 
         self.message_manager.add_model_output(model_output)
         
@@ -135,17 +224,25 @@ class BrowserUseAgent(Agent):
         self.state.history.history.append(
             AgentHistory(
                 model_output=model_output,
-                result=result,
+                result=self.state.last_result,
                 state=history_state,
                 metadata=None,
             )
         )
 
         # 4. Update failure count
-        if any(r.error for r in result):
+        if any(r.error for r in self.state.last_result):
             self.state.consecutive_failures += 1
         else:
             self.state.consecutive_failures = 0
+        
+        # 5. 修正: 精确复制 v0.1.48 的日志记录逻辑
+        if model_output:
+            logger.info(f'🤷 Eval: {model_output.current_state.evaluation_previous_goal}')
+            logger.info(f'🧠 Memory: {model_output.current_state.memory}')
+            logger.info(f'🎯 Next goal: {model_output.current_state.next_goal}')
+            for i, action in enumerate(model_output.action):
+                logger.info(f'🛠️  Action {i + 1}/{len(model_output.action)}: {action.model_dump_json(exclude_unset=True)}')
 
     async def step(self, step_info: AgentStepInfo) -> None:
         """
@@ -158,17 +255,23 @@ class BrowserUseAgent(Agent):
 
         if self.current_scene == 'desktop':
             await self._desktop_step(step_info)
-        else:  # 'web' scene
-            # Delegate to the original, robust implementation for web logic
+        else:
+            self._log_messages_for_llm(self.message_manager.get_messages())
             await super().step(step_info)
-
 
     async def multi_act(self, actions: list[ActionModel], check_for_new_elements: bool = True) -> list[ActionResult]:
         """
         Execute a list of actions, passing the agent's context to the controller.
         """
+        if not actions:
+            return [ActionResult(error="Received an empty action list to execute.")]
+
         results = []
         for action in actions:
+            if not action.model_dump(exclude_unset=True):
+                results.append(ActionResult(error="Received an empty action object {}."))
+                continue
+
             result = await self.controller.act(
                 action,
                 self.browser_context,
@@ -178,10 +281,6 @@ class BrowserUseAgent(Agent):
                 context=self.context_data,
             )
             results.append(result)
-            
-            if self.current_scene == 'web':
-                if await self.browser_context.check_for_page_change(check_for_new_elements):
-                    break
         return results
 
     @time_execution_async("--run (agent)")

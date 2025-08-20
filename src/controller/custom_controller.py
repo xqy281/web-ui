@@ -3,8 +3,8 @@
 import pdb
 import pyperclip
 import json
-import base64 # 新增导入
-from typing import Optional, Type, Callable, Dict, Any, Union, Awaitable, TypeVar, Tuple # 新增 Tuple
+import base64
+from typing import Optional, Type, Callable, Dict, Any, Union, Awaitable, TypeVar, Tuple
 from pydantic import BaseModel
 from browser_use.agent.views import ActionResult
 from browser_use.browser.context import BrowserContext
@@ -53,6 +53,7 @@ class CustomController(Controller):
         self.mcp_client = None
         self.mcp_server_config = None
         self._omni_parser_client: Optional[OmniParserClient] = None
+        self.current_action_context: Optional[Dict[str, Any]] = None
 
     @property
     def omni_parser_client(self) -> OmniParserClient:
@@ -61,7 +62,6 @@ class CustomController(Controller):
             self._omni_parser_client = OmniParserClient()
         return self._omni_parser_client
 
-    # MODIFIED: Return screenshot data along with elements
     async def get_desktop_elements(self) -> Tuple[list[Dict[str, Any]], str]:
         """
         Captures the screen, parses it for UI elements, and returns both the
@@ -74,10 +74,8 @@ class CustomController(Controller):
             pyautogui.screenshot(screenshot_path)
             logger.info(f"Desktop screenshot saved to temporary file: {screenshot_path}")
             
-            # Get parsed elements
             parsed_elements = await self.omni_parser_client.parse_image(screenshot_path)
             
-            # Read image and encode to base64
             with open(screenshot_path, "rb") as image_file:
                 screenshot_b64 = base64.b64encode(image_file.read()).decode('utf-8')
                 
@@ -148,31 +146,31 @@ class CustomController(Controller):
         @self.registry.action(
             "Captures the entire desktop screen and returns a list of all visible UI elements, including their descriptions and locations. Use this to understand what is currently on the desktop."
         )
-        async def get_desktop_ui_elements(context: Dict[str, Any]) -> ActionResult:
-            # MODIFIED: Now returns a tuple
+        async def get_desktop_ui_elements() -> ActionResult:
             elements, screenshot_b64 = await self.get_desktop_elements()
             formatted_elements = "\n".join([f"- {el['content']} ({el['type']})" for el in elements])
             result_text = f"Found {len(elements)} elements on the desktop:\n{formatted_elements}"
             
-            if isinstance(context, dict):
-                context['desktop_elements'] = elements
-            else:
-                logger.warning("Context is not a dictionary, cannot store desktop elements.")
-
+            if isinstance(self.current_action_context, dict):
+                self.current_action_context['desktop_elements'] = elements
+            
             return ActionResult(long_term_memory=result_text)
 
         @self.registry.action(
             "Clicks on a specific UI element on the desktop based on its text or AI-generated description. You should call `get_desktop_ui_elements` first to know what to click on."
         )
-        async def click_on_desktop(element_description: str, context: Dict[str, Any]) -> ActionResult:
-            if not isinstance(context, dict) or 'desktop_elements' not in context:
+        async def click_on_desktop(element_description: str) -> ActionResult:
+            if not isinstance(self.current_action_context, dict) or 'desktop_elements' not in self.current_action_context:
                  return ActionResult(error="Desktop elements not found in context. Please run `get_desktop_ui_elements` first.")
 
-            elements = context['desktop_elements']
-            target_element = next((el for el in elements if el['content'].strip().lower() == element_description.strip().lower()), None)
+            elements = self.current_action_context['desktop_elements']
+            
+            # 修正: 使用 'in' 进行模糊匹配，并移除末尾的句号
+            search_term = element_description.strip().lower().rstrip('.')
+            target_element = next((el for el in elements if search_term in el['content'].strip().lower()), None)
 
             if not target_element:
-                return ActionResult(error=f"Element with description '{element_description}' not found on the desktop.")
+                return ActionResult(error=f"Element with description containing '{search_term}' not found on the desktop.")
 
             bbox = target_element['bbox']
             screen_width, screen_height = pyautogui.size()
@@ -228,6 +226,7 @@ class CustomController(Controller):
             context: Context | None = None,
     ) -> ActionResult:
         """Execute an action"""
+        self.current_action_context = context
 
         try:
             for action_name, params in action.model_dump(exclude_unset=True).items():
@@ -258,6 +257,8 @@ class CustomController(Controller):
             return ActionResult()
         except Exception as e:
             raise e
+        finally:
+            self.current_action_context = None
 
     async def setup_mcp_client(self, mcp_server_config: Optional[Dict[str, Any]] = None):
         self.mcp_server_config = mcp_server_config
